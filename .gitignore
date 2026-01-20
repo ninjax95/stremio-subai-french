@@ -1,0 +1,4 @@
+node_modules/
+*.log
+*.pid
+subtitles_cache/*.srt
