@@ -42,6 +42,50 @@ if (!fs.existsSync(CONFIG.SUBTITLES_DIR)) {
 const cache = new NodeCache({ stdTTL: CONFIG.CACHE_TTL });
 
 // ============================================
+// SYSTÈME D'ÉVÉNEMENTS EN TEMPS RÉEL
+// ============================================
+
+// État global pour le monitoring
+const state = {
+    status: 'idle', // idle, searching, translating, done, error
+    currentMedia: null,
+    progress: 0,
+    totalSubtitles: 0,
+    translatedSubtitles: 0,
+    currentBatch: 0,
+    totalBatches: 0,
+    logs: [],
+    ollamaAvailable: false
+};
+
+// Clients SSE connectés
+const sseClients = new Set();
+
+// Envoyer un événement à tous les clients
+function broadcast(event, data) {
+    const message = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+    sseClients.forEach(client => {
+        client.write(message);
+    });
+}
+
+// Logger avec broadcast
+function log(message, type = 'info') {
+    const timestamp = new Date().toLocaleTimeString('fr-FR');
+    const logEntry = { timestamp, message, type };
+    state.logs.push(logEntry);
+    if (state.logs.length > 100) state.logs.shift(); // Garder les 100 derniers
+    console.log(`[${timestamp}] ${message}`);
+    broadcast('log', logEntry);
+}
+
+// Mettre à jour l'état et broadcaster
+function updateState(updates) {
+    Object.assign(state, updates);
+    broadcast('state', state);
+}
+
+// ============================================
 // MANIFEST DE L'ADDON
 // ============================================
 
@@ -220,10 +264,14 @@ async function checkOllama() {
         const response = await axios.get(`${CONFIG.OLLAMA_URL}/api/tags`, { timeout: 5000 });
         const models = response.data.models || [];
         const hasModel = models.some(m => m.name.includes(CONFIG.OLLAMA_MODEL));
-        console.log(`[Ollama] Disponible. Modèle ${CONFIG.OLLAMA_MODEL}: ${hasModel ? 'OK' : 'Non trouvé'}`);
-        return hasModel;
+        const available = hasModel;
+        updateState({ ollamaAvailable: available });
+        if (available) {
+            log(`Ollama connecté (${CONFIG.OLLAMA_MODEL})`, 'success');
+        }
+        return available;
     } catch (error) {
-        console.log(`[Ollama] Non disponible: ${error.message}`);
+        updateState({ ollamaAvailable: false });
         return false;
     }
 }
@@ -264,11 +312,13 @@ async function translateSRT(srtContent, imdbId) {
 
     // Vérifier si déjà traduit
     if (fs.existsSync(cacheFile)) {
-        console.log(`[Translate] Utilisation du cache pour ${imdbId}`);
+        log(`Traduction en cache pour ${imdbId}`, 'success');
+        updateState({ status: 'done', progress: 100 });
         return fs.readFileSync(cacheFile, 'utf8');
     }
 
-    console.log(`[Mixtral] Début de la traduction pour ${imdbId}...`);
+    log(`Début de la traduction pour ${imdbId}...`, 'info');
+    updateState({ status: 'translating', currentMedia: imdbId, progress: 0 });
 
     const parser = new SrtParser();
     let parsed;
@@ -276,18 +326,28 @@ async function translateSRT(srtContent, imdbId) {
     try {
         parsed = parser.fromSrt(srtContent);
     } catch (e) {
-        console.error(`[Translate] Erreur parsing SRT: ${e.message}`);
+        log(`Erreur parsing SRT: ${e.message}`, 'error');
+        updateState({ status: 'error' });
         return null;
     }
 
     if (!parsed || parsed.length === 0) {
-        console.error(`[Translate] SRT vide ou invalide`);
+        log(`SRT vide ou invalide`, 'error');
+        updateState({ status: 'error' });
         return null;
     }
 
     const batchSize = 20; // 20 sous-titres par lot
     const totalBatches = Math.ceil(parsed.length / batchSize);
-    console.log(`[Mixtral] ${parsed.length} sous-titres en ${totalBatches} lots...`);
+
+    updateState({
+        totalSubtitles: parsed.length,
+        totalBatches: totalBatches,
+        translatedSubtitles: 0,
+        currentBatch: 0
+    });
+
+    log(`${parsed.length} sous-titres à traduire (${totalBatches} lots)`, 'info');
 
     const translatedParts = [];
 
@@ -302,8 +362,15 @@ async function translateSRT(srtContent, imdbId) {
     for (let i = 0; i < parsed.length; i += batchSize) {
         const batch = parsed.slice(i, i + batchSize);
         const batchNum = Math.floor(i / batchSize) + 1;
+        const progress = Math.round((i / parsed.length) * 100);
 
-        console.log(`[Mixtral] Lot ${batchNum}/${totalBatches}`);
+        updateState({
+            currentBatch: batchNum,
+            progress: progress,
+            translatedSubtitles: translatedParts.length
+        });
+
+        log(`Traduction lot ${batchNum}/${totalBatches} (${progress}%)`, 'progress');
 
         // Créer le texte à traduire (chaque ligne numérotée)
         const textToTranslate = batch.map((sub, idx) => `[${idx + 1}] ${sub.text}`).join('\n');
@@ -323,16 +390,19 @@ async function translateSRT(srtContent, imdbId) {
                 });
             });
         } catch (e) {
+            log(`Erreur lot ${batchNum}: ${e.message}`, 'error');
             // En cas d'erreur, garder les originaux
             batch.forEach(sub => translatedParts.push(sub));
         }
 
         // Sauvegarder après chaque lot
         savePartial();
-        console.log(`[Mixtral] Sauvegardé ${translatedParts.length}/${parsed.length} sous-titres`);
+
+        updateState({ translatedSubtitles: translatedParts.length });
     }
 
-    console.log(`[Mixtral] Traduction terminée!`);
+    log(`Traduction terminée! ${parsed.length} sous-titres traduits`, 'success');
+    updateState({ status: 'done', progress: 100, translatedSubtitles: parsed.length });
 
     // Retourner le contenu final
     return fs.readFileSync(cacheFile, 'utf8');
@@ -356,9 +426,9 @@ async function serveTranslatedSubtitle(imdbId) {
 // ============================================
 
 builder.defineSubtitlesHandler(async (args) => {
-    console.log(`\n========================================`);
-    console.log(`[Subtitles] Requête: ${args.type}/${args.id}`);
-    console.log(`========================================`);
+    const mediaId = args.id;
+    log(`Nouvelle requête: ${args.type}/${mediaId}`, 'info');
+    updateState({ status: 'searching', currentMedia: mediaId });
 
     try {
         // Parser l'ID (tt1234567 ou tt1234567:1:2 pour les séries)
@@ -372,7 +442,7 @@ builder.defineSubtitlesHandler(async (args) => {
         // ============================================
         // ÉTAPE 1: Chercher des sous-titres français existants
         // ============================================
-        console.log(`\n[Étape 1] Recherche de sous-titres français...`);
+        log(`Recherche de sous-titres français...`, 'info');
 
         // Recherche parallèle sur les différentes sources
         const [opensubsFr, osLegacyFr] = await Promise.all([
@@ -384,7 +454,8 @@ builder.defineSubtitlesHandler(async (args) => {
         const frenchSubs = [...opensubsFr, ...osLegacyFr];
 
         if (frenchSubs.length > 0) {
-            console.log(`[Résultat] ${frenchSubs.length} sous-titres français trouvés!`);
+            log(`${frenchSubs.length} sous-titres français trouvés!`, 'success');
+            updateState({ status: 'done' });
 
             frenchSubs.forEach(sub => {
                 subtitles.push({
@@ -401,7 +472,7 @@ builder.defineSubtitlesHandler(async (args) => {
         // ÉTAPE 2: Si pas de français, chercher anglais + traduire
         // ============================================
         if (frenchSubs.length === 0) {
-            console.log(`\n[Étape 2] Pas de français, recherche anglais...`);
+            log(`Pas de français trouvé, recherche anglais...`, 'info');
 
             // Chercher des sous-titres anglais
             const [opensubsEn, osLegacyEn] = await Promise.all([
@@ -412,12 +483,13 @@ builder.defineSubtitlesHandler(async (args) => {
             const englishSubs = [...opensubsEn, ...osLegacyEn];
 
             if (englishSubs.length > 0) {
-                console.log(`[Résultat] ${englishSubs.length} sous-titres anglais trouvés`);
+                log(`${englishSubs.length} sous-titres anglais trouvés`, 'info');
 
                 // Vérifier si une traduction existe déjà en cache
                 const cacheFile = path.join(CONFIG.SUBTITLES_DIR, `${imdbId}_fr.srt`);
                 if (fs.existsSync(cacheFile)) {
-                    console.log(`[Cache] Traduction française trouvée en cache!`);
+                    log(`Traduction française en cache!`, 'success');
+                    updateState({ status: 'done' });
                     subtitles.unshift({
                         id: 'subai-french-translated',
                         url: `http://127.0.0.1:${CONFIG.PORT}/subtitles/${imdbId}_fr.srt`,
@@ -429,19 +501,22 @@ builder.defineSubtitlesHandler(async (args) => {
                     const ollamaAvailable = await checkOllama();
                     if (ollamaAvailable && englishSubs.length > 0) {
                         const bestEnglish = englishSubs[0];
-                        console.log(`[Translate] Lancement traduction en arrière-plan...`);
+                        log(`Lancement traduction en arrière-plan...`, 'info');
 
                         // Traduction asynchrone (sans bloquer la réponse)
                         downloadSubtitle(bestEnglish.url).then(srtContent => {
                             if (srtContent) {
-                                console.log(`[Translate] Traduction démarrée pour ${imdbId}...`);
+                                log(`Téléchargement terminé, traduction en cours...`, 'info');
                                 translateSRT(srtContent, imdbId).then(result => {
                                     if (result) {
-                                        console.log(`[Translate] Traduction terminée pour ${imdbId}! Disponible au prochain chargement.`);
+                                        log(`Traduction disponible!`, 'success');
                                     }
-                                }).catch(err => console.error(`[Translate] Erreur: ${err.message}`));
+                                }).catch(err => log(`Erreur traduction: ${err.message}`, 'error'));
                             }
-                        }).catch(err => console.error(`[Download] Erreur: ${err.message}`));
+                        }).catch(err => log(`Erreur téléchargement: ${err.message}`, 'error'));
+                    } else if (!ollamaAvailable) {
+                        log(`Ollama non disponible - traduction impossible`, 'error');
+                        updateState({ status: 'idle' });
                     }
                 }
 
@@ -456,12 +531,12 @@ builder.defineSubtitlesHandler(async (args) => {
             }
         }
 
-        console.log(`\n[Final] Retour de ${subtitles.length} sous-titres au total`);
+        log(`Retour de ${subtitles.length} sous-titres`, 'success');
         return { subtitles };
 
     } catch (error) {
-        console.error(`[Erreur] Handler: ${error.message}`);
-        console.error(error.stack);
+        log(`Erreur: ${error.message}`, 'error');
+        updateState({ status: 'error' });
         return { subtitles: [] };
     }
 });
@@ -480,6 +555,276 @@ app.use('/subtitles', (req, res, next) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
     next();
 }, express.static(CONFIG.SUBTITLES_DIR));
+
+// ============================================
+// INTERFACE DE MONITORING
+// ============================================
+
+// Page HTML de monitoring
+app.get('/monitor', (req, res) => {
+    res.send(`<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SubAI Monitor</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', system-ui, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            color: #fff;
+            min-height: 100vh;
+            padding: 20px;
+        }
+        .container {
+            max-width: 600px;
+            margin: 0 auto;
+        }
+        h1 {
+            text-align: center;
+            margin-bottom: 20px;
+            font-size: 1.5em;
+        }
+        h1 span { color: #4fc3f7; }
+
+        .status-card {
+            background: rgba(255,255,255,0.1);
+            border-radius: 12px;
+            padding: 20px;
+            margin-bottom: 15px;
+            backdrop-filter: blur(10px);
+        }
+        .status-header {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 15px;
+        }
+        .status-dot {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: #666;
+        }
+        .status-dot.idle { background: #666; }
+        .status-dot.searching { background: #ffc107; animation: pulse 1s infinite; }
+        .status-dot.translating { background: #4fc3f7; animation: pulse 1s infinite; }
+        .status-dot.done { background: #4caf50; }
+        .status-dot.error { background: #f44336; }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        .status-text {
+            font-size: 1.1em;
+            font-weight: 500;
+        }
+        .media-name {
+            color: #4fc3f7;
+            font-size: 0.9em;
+            margin-top: 5px;
+        }
+
+        .progress-section {
+            margin-top: 15px;
+        }
+        .progress-bar {
+            height: 8px;
+            background: rgba(255,255,255,0.2);
+            border-radius: 4px;
+            overflow: hidden;
+            margin-bottom: 8px;
+        }
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #4fc3f7, #00e5ff);
+            border-radius: 4px;
+            transition: width 0.3s ease;
+            width: 0%;
+        }
+        .progress-stats {
+            display: flex;
+            justify-content: space-between;
+            font-size: 0.85em;
+            color: rgba(255,255,255,0.7);
+        }
+
+        .logs-card {
+            background: rgba(0,0,0,0.3);
+            border-radius: 12px;
+            padding: 15px;
+            max-height: 300px;
+            overflow-y: auto;
+        }
+        .logs-title {
+            font-size: 0.9em;
+            color: rgba(255,255,255,0.6);
+            margin-bottom: 10px;
+        }
+        .log-entry {
+            font-family: 'Consolas', monospace;
+            font-size: 0.8em;
+            padding: 4px 0;
+            border-bottom: 1px solid rgba(255,255,255,0.05);
+        }
+        .log-entry:last-child { border-bottom: none; }
+        .log-time { color: #888; margin-right: 8px; }
+        .log-info { color: #4fc3f7; }
+        .log-success { color: #4caf50; }
+        .log-error { color: #f44336; }
+        .log-progress { color: #ffc107; }
+
+        .ollama-status {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 0.85em;
+            padding: 10px;
+            background: rgba(0,0,0,0.2);
+            border-radius: 8px;
+            margin-top: 15px;
+        }
+        .ollama-status.available { color: #4caf50; }
+        .ollama-status.unavailable { color: #f44336; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎬 <span>SubAI</span> Monitor</h1>
+
+        <div class="status-card">
+            <div class="status-header">
+                <div class="status-dot" id="statusDot"></div>
+                <span class="status-text" id="statusText">En attente...</span>
+            </div>
+            <div class="media-name" id="mediaName"></div>
+
+            <div class="progress-section" id="progressSection" style="display: none;">
+                <div class="progress-bar">
+                    <div class="progress-fill" id="progressFill"></div>
+                </div>
+                <div class="progress-stats">
+                    <span id="progressPercent">0%</span>
+                    <span id="progressDetail">0 / 0 sous-titres</span>
+                </div>
+            </div>
+
+            <div class="ollama-status" id="ollamaStatus">
+                <span>🤖</span>
+                <span>Ollama: Vérification...</span>
+            </div>
+        </div>
+
+        <div class="logs-card">
+            <div class="logs-title">📋 Activité</div>
+            <div id="logs"></div>
+        </div>
+    </div>
+
+    <script>
+        const statusDot = document.getElementById('statusDot');
+        const statusText = document.getElementById('statusText');
+        const mediaName = document.getElementById('mediaName');
+        const progressSection = document.getElementById('progressSection');
+        const progressFill = document.getElementById('progressFill');
+        const progressPercent = document.getElementById('progressPercent');
+        const progressDetail = document.getElementById('progressDetail');
+        const ollamaStatus = document.getElementById('ollamaStatus');
+        const logsDiv = document.getElementById('logs');
+
+        const statusLabels = {
+            idle: 'En attente',
+            searching: 'Recherche de sous-titres...',
+            translating: 'Traduction en cours...',
+            done: 'Terminé',
+            error: 'Erreur'
+        };
+
+        function updateUI(state) {
+            statusDot.className = 'status-dot ' + state.status;
+            statusText.textContent = statusLabels[state.status] || state.status;
+
+            if (state.currentMedia) {
+                mediaName.textContent = '📺 ' + state.currentMedia;
+                mediaName.style.display = 'block';
+            } else {
+                mediaName.style.display = 'none';
+            }
+
+            if (state.status === 'translating' || state.status === 'done') {
+                progressSection.style.display = 'block';
+                progressFill.style.width = state.progress + '%';
+                progressPercent.textContent = state.progress + '%';
+                progressDetail.textContent = state.translatedSubtitles + ' / ' + state.totalSubtitles + ' sous-titres';
+            } else {
+                progressSection.style.display = 'none';
+            }
+
+            ollamaStatus.className = 'ollama-status ' + (state.ollamaAvailable ? 'available' : 'unavailable');
+            ollamaStatus.innerHTML = '<span>🤖</span><span>Ollama: ' + (state.ollamaAvailable ? 'Connecté (${CONFIG.OLLAMA_MODEL})' : 'Non disponible') + '</span>';
+        }
+
+        function addLog(entry) {
+            const div = document.createElement('div');
+            div.className = 'log-entry';
+            div.innerHTML = '<span class="log-time">' + entry.timestamp + '</span><span class="log-' + entry.type + '">' + entry.message + '</span>';
+            logsDiv.insertBefore(div, logsDiv.firstChild);
+
+            // Garder max 50 logs visibles
+            while (logsDiv.children.length > 50) {
+                logsDiv.removeChild(logsDiv.lastChild);
+            }
+        }
+
+        // Connexion SSE
+        const evtSource = new EventSource('/events');
+
+        evtSource.addEventListener('state', (e) => {
+            updateUI(JSON.parse(e.data));
+        });
+
+        evtSource.addEventListener('log', (e) => {
+            addLog(JSON.parse(e.data));
+        });
+
+        evtSource.onerror = () => {
+            statusText.textContent = 'Connexion perdue...';
+            statusDot.className = 'status-dot error';
+        };
+
+        // Charger l'état initial
+        fetch('/api/state').then(r => r.json()).then(updateUI);
+    </script>
+</body>
+</html>`);
+});
+
+// Endpoint SSE pour les événements en temps réel
+app.get('/events', (req, res) => {
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+
+    // Envoyer l'état initial
+    res.write(`event: state\ndata: ${JSON.stringify(state)}\n\n`);
+
+    // Ajouter le client à la liste
+    sseClients.add(res);
+
+    // Nettoyer quand le client se déconnecte
+    req.on('close', () => {
+        sseClients.delete(res);
+    });
+});
+
+// API pour récupérer l'état
+app.get('/api/state', (req, res) => {
+    res.json(state);
+});
 
 // Intégrer le router Stremio
 const addonRouter = getRouter(addon);
@@ -500,16 +845,10 @@ console.log(`
 ║  📋 Manifest:                                          ║
 ║     http://127.0.0.1:${CONFIG.PORT}/manifest.json               ║
 ║                                                        ║
-║  🔧 Pour installer dans Stremio:                       ║
-║     1. Ouvrir Stremio                                  ║
-║     2. Aller dans les paramètres (⚙️)                   ║
-║     3. Cliquer sur "Addons"                            ║
-║     4. Cliquer sur "Community Addons"                  ║
-║     5. Coller l'URL du manifest dans la barre          ║
+║  📊 Monitor (temps réel):                              ║
+║     http://127.0.0.1:${CONFIG.PORT}/monitor                     ║
 ║                                                        ║
-║  🤖 Ollama (traduction IA):                            ║
-║     URL: ${CONFIG.OLLAMA_URL.padEnd(35)}    ║
-║     Modèle: ${CONFIG.OLLAMA_MODEL.padEnd(32)}    ║
+║  🤖 Ollama: ${CONFIG.OLLAMA_MODEL.padEnd(39)}  ║
 ║                                                        ║
 ╚════════════════════════════════════════════════════════╝
 `);
