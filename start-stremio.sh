@@ -18,6 +18,8 @@ else
     # Vérifier que le serveur a démarré
     if curl -s http://127.0.0.1:7000/manifest.json > /dev/null 2>&1; then
         echo "[SubAI] Serveur démarré sur le port 7000"
+        # Ouvrir le monitor dans le navigateur
+        xdg-open http://127.0.0.1:7000/monitor > /dev/null 2>&1 &
     else
         echo "[SubAI] Erreur: le serveur n'a pas démarré"
         cat "$LOG_FILE"
