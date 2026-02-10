@@ -55,7 +55,14 @@ const state = {
     currentBatch: 0,
     totalBatches: 0,
     logs: [],
-    ollamaAvailable: false
+    ollamaAvailable: false,
+    ollamaModel: CONFIG.OLLAMA_MODEL
+};
+
+// Gestion des traductions en cours
+let currentTranslation = {
+    mediaId: null,
+    shouldCancel: false
 };
 
 // Clients SSE connectés
@@ -307,18 +314,18 @@ ${text}`;
 /**
  * Traduit un fichier SRT complet avec Mixtral (par lots)
  */
-async function translateSRT(srtContent, imdbId) {
-    const cacheFile = path.join(CONFIG.SUBTITLES_DIR, `${imdbId}_fr.srt`);
+async function translateSRT(srtContent, mediaId) {
+    const cacheFile = path.join(CONFIG.SUBTITLES_DIR, `${mediaId}_fr.srt`);
 
     // Vérifier si déjà traduit
     if (fs.existsSync(cacheFile)) {
-        log(`Traduction en cache pour ${imdbId}`, 'success');
+        log(`Traduction en cache pour ${mediaId}`, 'success');
         updateState({ status: 'done', progress: 100 });
         return fs.readFileSync(cacheFile, 'utf8');
     }
 
-    log(`Début de la traduction pour ${imdbId}...`, 'info');
-    updateState({ status: 'translating', currentMedia: imdbId, progress: 0 });
+    log(`Debut de la traduction pour ${mediaId}...`, 'info');
+    updateState({ status: 'translating', currentMedia: mediaId, progress: 0 });
 
     const parser = new SrtParser();
     let parsed;
@@ -360,6 +367,17 @@ async function translateSRT(srtContent, imdbId) {
     };
 
     for (let i = 0; i < parsed.length; i += batchSize) {
+        // Vérifier si la traduction a été annulée
+        if (currentTranslation.shouldCancel && currentTranslation.mediaId !== mediaId) {
+            log(`Traduction annulee pour ${mediaId}`, 'info');
+            updateState({ status: 'idle', progress: 0 });
+            // Supprimer le fichier partiel
+            if (fs.existsSync(cacheFile)) {
+                fs.unlinkSync(cacheFile);
+            }
+            return null;
+        }
+
         const batch = parsed.slice(i, i + batchSize);
         const batchNum = Math.floor(i / batchSize) + 1;
         const progress = Math.round((i / parsed.length) * 100);
@@ -428,6 +446,19 @@ async function serveTranslatedSubtitle(imdbId) {
 builder.defineSubtitlesHandler(async (args) => {
     const mediaId = args.id;
     log(`Nouvelle requête: ${args.type}/${mediaId}`, 'info');
+
+    // Annuler la traduction en cours si c'est un média différent
+    if (currentTranslation.mediaId && currentTranslation.mediaId !== mediaId) {
+        log(`Annulation de la traduction en cours pour ${currentTranslation.mediaId}`, 'info');
+        currentTranslation.shouldCancel = true;
+    }
+
+    // Réinitialiser pour ce nouveau média
+    currentTranslation = {
+        mediaId: mediaId,
+        shouldCancel: false
+    };
+
     updateState({ status: 'searching', currentMedia: mediaId });
 
     try {
@@ -486,13 +517,13 @@ builder.defineSubtitlesHandler(async (args) => {
                 log(`${englishSubs.length} sous-titres anglais trouvés`, 'info');
 
                 // Vérifier si une traduction existe déjà en cache
-                const cacheFile = path.join(CONFIG.SUBTITLES_DIR, `${imdbId}_fr.srt`);
+                const cacheFile = path.join(CONFIG.SUBTITLES_DIR, `${mediaId}_fr.srt`);
                 if (fs.existsSync(cacheFile)) {
                     log(`Traduction française en cache!`, 'success');
                     updateState({ status: 'done' });
                     subtitles.unshift({
                         id: 'subai-french-translated',
-                        url: `http://127.0.0.1:${CONFIG.PORT}/subtitles/${imdbId}_fr.srt`,
+                        url: `http://127.0.0.1:${CONFIG.PORT}/subtitles/${mediaId}_fr.srt`,
                         lang: 'fre',
                         title: 'SubAI (IA)'
                     });
@@ -506,14 +537,14 @@ builder.defineSubtitlesHandler(async (args) => {
                         // Traduction asynchrone (sans bloquer la réponse)
                         downloadSubtitle(bestEnglish.url).then(srtContent => {
                             if (srtContent) {
-                                log(`Téléchargement terminé, traduction en cours...`, 'info');
-                                translateSRT(srtContent, imdbId).then(result => {
+                                log(`Telechargement termine, traduction en cours...`, 'info');
+                                translateSRT(srtContent, mediaId).then(result => {
                                     if (result) {
                                         log(`Traduction disponible!`, 'success');
                                     }
                                 }).catch(err => log(`Erreur traduction: ${err.message}`, 'error'));
                             }
-                        }).catch(err => log(`Erreur téléchargement: ${err.message}`, 'error'));
+                        }).catch(err => log(`Erreur telechargement: ${err.message}`, 'error'));
                     } else if (!ollamaAvailable) {
                         log(`Ollama non disponible - traduction impossible`, 'error');
                         updateState({ status: 'idle' });
@@ -689,6 +720,81 @@ app.get('/monitor', (req, res) => {
         }
         .ollama-status.available { color: #4caf50; }
         .ollama-status.unavailable { color: #f44336; }
+
+        .cache-card {
+            background: rgba(0,0,0,0.3);
+            border-radius: 12px;
+            padding: 15px;
+            margin-top: 15px;
+        }
+        .cache-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+        .cache-title {
+            font-size: 0.9em;
+            color: rgba(255,255,255,0.6);
+        }
+        .cache-count {
+            font-size: 0.85em;
+            color: #4fc3f7;
+            background: rgba(79,195,247,0.2);
+            padding: 4px 8px;
+            border-radius: 4px;
+        }
+        .cache-list {
+            max-height: 300px;
+            overflow-y: auto;
+        }
+        .cache-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 10px;
+            background: rgba(255,255,255,0.05);
+            border-radius: 8px;
+            margin-bottom: 8px;
+        }
+        .cache-item:hover {
+            background: rgba(255,255,255,0.08);
+        }
+        .cache-info {
+            flex: 1;
+        }
+        .cache-imdb {
+            font-family: 'Consolas', monospace;
+            font-size: 0.9em;
+            color: #4fc3f7;
+            margin-bottom: 4px;
+        }
+        .cache-meta {
+            font-size: 0.75em;
+            color: rgba(255,255,255,0.5);
+        }
+        .btn-delete {
+            background: #f44336;
+            color: white;
+            border: none;
+            padding: 6px 12px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.85em;
+            transition: background 0.2s;
+        }
+        .btn-delete:hover {
+            background: #d32f2f;
+        }
+        .btn-delete:active {
+            transform: scale(0.95);
+        }
+        .empty-cache {
+            text-align: center;
+            padding: 20px;
+            color: rgba(255,255,255,0.4);
+            font-size: 0.9em;
+        }
     </style>
 </head>
 <body>
@@ -721,6 +827,16 @@ app.get('/monitor', (req, res) => {
         <div class="logs-card">
             <div class="logs-title">📋 Activité</div>
             <div id="logs"></div>
+        </div>
+
+        <div class="cache-card">
+            <div class="cache-header">
+                <span class="cache-title">💾 Sous-titres en cache</span>
+                <span class="cache-count" id="cacheCount">0</span>
+            </div>
+            <div class="cache-list" id="cacheList">
+                <div class="empty-cache">Aucun sous-titre en cache</div>
+            </div>
         </div>
     </div>
 
@@ -764,7 +880,7 @@ app.get('/monitor', (req, res) => {
             }
 
             ollamaStatus.className = 'ollama-status ' + (state.ollamaAvailable ? 'available' : 'unavailable');
-            ollamaStatus.innerHTML = '<span>🤖</span><span>Ollama: ' + (state.ollamaAvailable ? 'Connecté (${CONFIG.OLLAMA_MODEL})' : 'Non disponible') + '</span>';
+            ollamaStatus.innerHTML = '<span>🤖</span><span>Ollama: ' + (state.ollamaAvailable ? 'Connecté (' + state.ollamaModel + ')' : 'Non disponible') + '</span>';
         }
 
         function addLog(entry) {
@@ -780,23 +896,125 @@ app.get('/monitor', (req, res) => {
         }
 
         // Connexion SSE
+        console.log('[SubAI] Connexion SSE...');
         const evtSource = new EventSource('/events');
 
         evtSource.addEventListener('state', (e) => {
+            console.log('[SubAI] Event state recu');
             updateUI(JSON.parse(e.data));
         });
 
         evtSource.addEventListener('log', (e) => {
+            console.log('[SubAI] Event log recu');
             addLog(JSON.parse(e.data));
         });
 
-        evtSource.onerror = () => {
+        evtSource.addEventListener('open', () => {
+            console.log('[SubAI] SSE connecte');
+        });
+
+        evtSource.onerror = (err) => {
+            console.error('[SubAI] Erreur SSE:', err);
             statusText.textContent = 'Connexion perdue...';
             statusDot.className = 'status-dot error';
         };
 
-        // Charger l'état initial
-        fetch('/api/state').then(r => r.json()).then(updateUI);
+        // Charger l'etat initial
+        console.log('[SubAI] Chargement initial...');
+        fetch('/api/state')
+            .then(r => {
+                console.log('[SubAI] Reponse recue:', r.status);
+                return r.json();
+            })
+            .then(state => {
+                console.log('[SubAI] Etat recu:', state);
+                updateUI(state);
+            })
+            .catch(err => {
+                console.error('[SubAI] Erreur chargement:', err);
+                statusText.textContent = 'Erreur de chargement';
+                statusDot.className = 'status-dot error';
+            });
+
+        // Gestion du cache
+        const cacheList = document.getElementById('cacheList');
+        const cacheCount = document.getElementById('cacheCount');
+
+        function formatSize(bytes) {
+            if (bytes < 1024) return bytes + ' B';
+            if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+            return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
+        }
+
+        function formatDate(dateStr) {
+            const date = new Date(dateStr);
+            const now = new Date();
+            const diff = now - date;
+            const minutes = Math.floor(diff / 60000);
+            const hours = Math.floor(minutes / 60);
+            const days = Math.floor(hours / 24);
+
+            if (minutes < 1) return 'maintenant';
+            if (minutes < 60) return 'il y a ' + minutes + ' min';
+            if (hours < 24) return 'il y a ' + hours + 'h';
+            return 'il y a ' + days + 'j';
+        }
+
+        function formatMediaId(mediaId) {
+            const parts = mediaId.split(':');
+            if (parts.length === 3) {
+                // Serie: tt1234567:13:11 -> S13E11
+                return parts[0] + ' - S' + parts[1].padStart(2, '0') + 'E' + parts[2].padStart(2, '0');
+            } else {
+                // Film: tt1234567 -> Film
+                return parts[0] + ' - Film';
+            }
+        }
+
+        function loadCache() {
+            fetch('/api/cache')
+                .then(r => r.json())
+                .then(data => {
+                    cacheCount.textContent = data.count;
+
+                    if (data.files.length === 0) {
+                        cacheList.innerHTML = '<div class="empty-cache">Aucun sous-titre en cache</div>';
+                        return;
+                    }
+
+                    cacheList.innerHTML = data.files.map(file => {
+                        return '<div class="cache-item">' +
+                            '<div class="cache-info">' +
+                            '<div class="cache-imdb">' + formatMediaId(file.imdbId) + '</div>' +
+                            '<div class="cache-meta">' + formatSize(file.size) + ' - ' + formatDate(file.modified) + '</div>' +
+                            '</div>' +
+                            '<button class="btn-delete" onclick="deleteCache(' + "'" + file.filename + "'" + ')">Supprimer</button>' +
+                            '</div>';
+                    }).join('');
+                })
+                .catch(err => console.error('Erreur chargement cache:', err));
+        }
+
+        window.deleteCache = function(filename) {
+            if (!confirm('Supprimer ce sous-titre ?\\n' + filename)) return;
+
+            fetch('/api/cache/' + filename, { method: 'DELETE' })
+                .then(r => r.json())
+                .then(data => {
+                    if (data.success) {
+                        loadCache(); // Recharger la liste
+                    } else {
+                        alert('Erreur: ' + data.error);
+                    }
+                })
+                .catch(err => alert('Erreur: ' + err.message));
+        };
+
+        // Charger le cache au démarrage
+        loadCache();
+
+        // Recharger le cache toutes les 10 secondes
+        setInterval(loadCache, 10000);
     </script>
 </body>
 </html>`);
@@ -824,6 +1042,55 @@ app.get('/events', (req, res) => {
 // API pour récupérer l'état
 app.get('/api/state', (req, res) => {
     res.json(state);
+});
+
+// API pour lister les sous-titres en cache
+app.get('/api/cache', (req, res) => {
+    try {
+        const files = fs.readdirSync(CONFIG.SUBTITLES_DIR)
+            .filter(f => f.endsWith('.srt'))
+            .map(filename => {
+                const filepath = path.join(CONFIG.SUBTITLES_DIR, filename);
+                const stats = fs.statSync(filepath);
+                const imdbId = filename.replace('_fr.srt', '');
+                return {
+                    filename,
+                    imdbId,
+                    size: stats.size,
+                    modified: stats.mtime,
+                    url: `http://127.0.0.1:${CONFIG.PORT}/subtitles/${filename}`
+                };
+            })
+            .sort((a, b) => b.modified - a.modified); // Plus récent en premier
+
+        res.json({ files, count: files.length });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// API pour supprimer un sous-titre en cache
+app.delete('/api/cache/:filename', (req, res) => {
+    try {
+        const filename = req.params.filename;
+        // Sécurité : vérifier que c'est bien un fichier .srt
+        if (!filename.endsWith('.srt') || filename.includes('..')) {
+            return res.status(400).json({ error: 'Nom de fichier invalide' });
+        }
+
+        const filepath = path.join(CONFIG.SUBTITLES_DIR, filename);
+
+        if (!fs.existsSync(filepath)) {
+            return res.status(404).json({ error: 'Fichier non trouvé' });
+        }
+
+        fs.unlinkSync(filepath);
+        log(`Sous-titre supprimé: ${filename}`, 'info');
+        res.json({ success: true, message: `${filename} supprimé` });
+    } catch (error) {
+        log(`Erreur suppression: ${error.message}`, 'error');
+        res.status(500).json({ error: error.message });
+    }
 });
 
 // Intégrer le router Stremio

@@ -1,5 +1,43 @@
 # CLAUDE.md
 
+## 🚨 ISOLATION ABSOLUE DU SOUS-PROJET
+
+### Règles strictes d'isolation
+
+**Répertoire de base unique :** `/home/ninjax/claude/Idées applications/Sous-titre stremio/`
+
+**INTERDICTION FORMELLE de :**
+- Lire ou écrire des fichiers en dehors de `/home/ninjax/claude/Idées applications/Sous-titre stremio/`
+- Utiliser `..` pour sortir du répertoire
+- Accéder aux sous-projets frères (Geolocalisation, Gestion des Charges, etc.)
+- Accéder au répertoire parent `/home/ninjax/claude/Idées applications/`
+- Accéder à d'autres projets (IT2Society, Mitra, RH, clients, etc.)
+- Faire des recherches Glob/Grep en dehors de ce répertoire
+
+### Vérification obligatoire
+
+**AVANT toute opération de fichier (Read, Write, Edit, Glob, Grep), tu DOIS :**
+1. Vérifier que le chemin commence par `/home/ninjax/claude/Idées applications/Sous-titre stremio/`
+2. Si le chemin sort de ce répertoire, **REFUSER** l'opération
+3. Demander confirmation explicite à l'utilisateur
+
+### Exception unique
+
+Accès externe **UNIQUEMENT** si l'utilisateur dit explicitement :
+- "va lire dans [autre-projet]"
+- "accède à [chemin-externe]"
+- "copie depuis [autre-répertoire]"
+
+Sans cette confirmation explicite, **REFUSE TOUTE OPÉRATION EXTERNE**.
+
+## Session locale
+
+**Fichier de session :** `/home/ninjax/claude/Idées applications/Sous-titre stremio/.SESSION.md`
+- Ce fichier contient UNIQUEMENT le contexte de ce sous-projet
+- Ne mélange pas avec les sessions d'autres sous-projets ou projets
+
+---
+
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Project Overview
