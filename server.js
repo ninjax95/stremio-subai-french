@@ -22,6 +22,10 @@ const CONFIG = {
     // OpenSubtitles (optionnel - fonctionne sans clé avec limitations)
     OPENSUBTITLES_API_KEY: process.env.OPENSUBTITLES_API_KEY || '',
 
+    // OMDb API pour récupérer les titres (gratuit 1000 req/jour)
+    // Obtenir une clé sur: http://www.omdbapi.com/apikey.aspx
+    OMDB_API_KEY: process.env.OMDB_API_KEY || 'e6235f29',
+
     // Langues prioritaires pour la recherche
     TARGET_LANG: 'fr',  // Langue cible
     FALLBACK_LANG: 'en', // Langue pour traduction si pas de français
@@ -40,6 +44,9 @@ if (!fs.existsSync(CONFIG.SUBTITLES_DIR)) {
 
 // Cache en mémoire pour les résultats de recherche
 const cache = new NodeCache({ stdTTL: CONFIG.CACHE_TTL });
+
+// Cache pour les titres des films/séries
+const titlesCache = new NodeCache({ stdTTL: 86400 * 7 }); // 7 jours
 
 // ============================================
 // SYSTÈME D'ÉVÉNEMENTS EN TEMPS RÉEL
@@ -99,7 +106,7 @@ function updateState(updates) {
 const manifest = {
     id: 'org.stremio.frenchsubtitles',
     version: '1.0.0',
-    name: 'SubAI Français',
+    name: 'SubAI',
     description: 'Sous-titres français avec traduction IA automatique via Ollama',
     logo: 'https://upload.wikimedia.org/wikipedia/commons/thumb/c/c3/Flag_of_France.svg/320px-Flag_of_France.svg.png',
     types: ['movie', 'series'],
@@ -257,6 +264,44 @@ async function downloadSubtitle(url) {
         console.error(`[Download] Erreur: ${error.message}`);
         return null;
     }
+}
+
+// ============================================
+// RÉCUPÉRATION DES TITRES
+// ============================================
+
+/**
+ * Récupère le titre d'un film/série depuis OMDb
+ */
+async function getMediaTitle(imdbId) {
+    // Vérifier le cache
+    const cached = titlesCache.get(imdbId);
+    if (cached) return cached;
+
+    if (!CONFIG.OMDB_API_KEY) {
+        return null;
+    }
+
+    try {
+        const response = await axios.get(`http://www.omdbapi.com/`, {
+            params: {
+                i: imdbId,
+                apikey: CONFIG.OMDB_API_KEY
+            },
+            timeout: 5000
+        });
+
+        if (response.data && response.data.Title) {
+            const title = response.data.Title;
+            titlesCache.set(imdbId, title);
+            console.log(`[OMDb] ${imdbId} -> ${title}`);
+            return title;
+        }
+    } catch (error) {
+        console.error(`[OMDb] Erreur: ${error.message}`);
+    }
+
+    return null;
 }
 
 // ============================================
@@ -522,10 +567,9 @@ builder.defineSubtitlesHandler(async (args) => {
                     log(`Traduction française en cache!`, 'success');
                     updateState({ status: 'done' });
                     subtitles.unshift({
-                        id: 'subai-french-translated',
+                        id: 'SubAI',
                         url: `http://127.0.0.1:${CONFIG.PORT}/subtitles/${mediaId}_fr.srt`,
-                        lang: 'fre',
-                        title: 'SubAI (IA)'
+                        lang: 'fra'
                     });
                 } else {
                     // Vérifier si Ollama est disponible et lancer traduction en ARRIÈRE-PLAN
@@ -960,14 +1004,16 @@ app.get('/monitor', (req, res) => {
             return 'il y a ' + days + 'j';
         }
 
-        function formatMediaId(mediaId) {
+        function formatMediaId(mediaId, title) {
             const parts = mediaId.split(':');
+            const displayTitle = title || parts[0];
+
             if (parts.length === 3) {
-                // Serie: tt1234567:13:11 -> S13E11
-                return parts[0] + ' - S' + parts[1].padStart(2, '0') + 'E' + parts[2].padStart(2, '0');
+                // Serie: "The Walking Dead" - S13E11
+                return displayTitle + ' - S' + parts[1].padStart(2, '0') + 'E' + parts[2].padStart(2, '0');
             } else {
-                // Film: tt1234567 -> Film
-                return parts[0] + ' - Film';
+                // Film: "Inception"
+                return displayTitle;
             }
         }
 
@@ -985,7 +1031,7 @@ app.get('/monitor', (req, res) => {
                     cacheList.innerHTML = data.files.map(file => {
                         return '<div class="cache-item">' +
                             '<div class="cache-info">' +
-                            '<div class="cache-imdb">' + formatMediaId(file.imdbId) + '</div>' +
+                            '<div class="cache-imdb">' + formatMediaId(file.imdbId, file.title) + '</div>' +
                             '<div class="cache-meta">' + formatSize(file.size) + ' - ' + formatDate(file.modified) + '</div>' +
                             '</div>' +
                             '<button class="btn-delete" onclick="deleteCache(' + "'" + file.filename + "'" + ')">Supprimer</button>' +
@@ -1045,17 +1091,21 @@ app.get('/api/state', (req, res) => {
 });
 
 // API pour lister les sous-titres en cache
-app.get('/api/cache', (req, res) => {
+app.get('/api/cache', async (req, res) => {
     try {
         const files = fs.readdirSync(CONFIG.SUBTITLES_DIR)
             .filter(f => f.endsWith('.srt'))
             .map(filename => {
                 const filepath = path.join(CONFIG.SUBTITLES_DIR, filename);
                 const stats = fs.statSync(filepath);
-                const imdbId = filename.replace('_fr.srt', '');
+                const mediaId = filename.replace('_fr.srt', '');
+                const parts = mediaId.split(':');
+                const imdbId = parts[0];
+
                 return {
                     filename,
-                    imdbId,
+                    imdbId: mediaId,
+                    imdbOnly: imdbId,
                     size: stats.size,
                     modified: stats.mtime,
                     url: `http://127.0.0.1:${CONFIG.PORT}/subtitles/${filename}`
@@ -1063,7 +1113,18 @@ app.get('/api/cache', (req, res) => {
             })
             .sort((a, b) => b.modified - a.modified); // Plus récent en premier
 
-        res.json({ files, count: files.length });
+        // Récupérer les titres pour chaque fichier
+        const filesWithTitles = await Promise.all(
+            files.map(async (file) => {
+                const title = await getMediaTitle(file.imdbOnly);
+                return {
+                    ...file,
+                    title: title
+                };
+            })
+        );
+
+        res.json({ files: filesWithTitles, count: filesWithTitles.length });
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
