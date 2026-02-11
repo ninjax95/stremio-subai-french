@@ -333,7 +333,7 @@ async function checkOllama() {
  */
 async function translateWithMixtral(text) {
     try {
-        const prompt = `Traduis ce texte de l'anglais vers le français. Réponds UNIQUEMENT avec la traduction, rien d'autre.
+        const prompt = `Traduis les sous-titres suivants de l'anglais vers le français. GARDE EXACTEMENT le format [numéro] au début de chaque ligne.
 
 ${text}`;
 
@@ -367,6 +367,13 @@ async function translateSRT(srtContent, mediaId) {
         log(`Traduction en cache pour ${mediaId}`, 'success');
         updateState({ status: 'done', progress: 100 });
         return fs.readFileSync(cacheFile, 'utf8');
+    }
+
+    // Vérifier si cette traduction a été annulée avant même de commencer
+    if (currentTranslation.mediaId !== mediaId || currentTranslation.shouldCancel) {
+        log(`Traduction annulee avant demarrage pour ${mediaId}`, 'info');
+        updateState({ status: 'idle', progress: 0 });
+        return null;
     }
 
     log(`Debut de la traduction pour ${mediaId}...`, 'info');
@@ -412,8 +419,8 @@ async function translateSRT(srtContent, mediaId) {
     };
 
     for (let i = 0; i < parsed.length; i += batchSize) {
-        // Vérifier si la traduction a été annulée
-        if (currentTranslation.shouldCancel && currentTranslation.mediaId !== mediaId) {
+        // Vérifier si la traduction a été annulée OU si un nouveau média est prioritaire
+        if (currentTranslation.shouldCancel || currentTranslation.mediaId !== mediaId) {
             log(`Traduction annulee pour ${mediaId}`, 'info');
             updateState({ status: 'idle', progress: 0 });
             // Supprimer le fichier partiel
@@ -445,8 +452,8 @@ async function translateSRT(srtContent, mediaId) {
             batch.forEach((sub, idx) => {
                 // Essayer de trouver la ligne correspondante
                 let translatedText = lines[idx] || sub.text;
-                // Enlever le numéro [X] si présent
-                translatedText = translatedText.replace(/^\[\d+\]\s*/, '');
+                // Enlever tous les formats de numéros possibles : [X], X., X -, X. -, etc.
+                translatedText = translatedText.replace(/^\s*[\[\(]?\d+[\]\)]?[\.\-\s]*/, '');
                 translatedParts.push({
                     ...sub,
                     text: translatedText.trim() || sub.text
@@ -569,7 +576,7 @@ builder.defineSubtitlesHandler(async (args) => {
                     subtitles.unshift({
                         id: 'SubAI',
                         url: `http://127.0.0.1:${CONFIG.PORT}/subtitles/${mediaId}_fr.srt`,
-                        lang: 'fra'
+                        lang: 'SubAI'
                     });
                 } else {
                     // Vérifier si Ollama est disponible et lancer traduction en ARRIÈRE-PLAN
@@ -1143,6 +1150,17 @@ app.delete('/api/cache/:filename', (req, res) => {
 
         if (!fs.existsSync(filepath)) {
             return res.status(404).json({ error: 'Fichier non trouvé' });
+        }
+
+        // Extraire le mediaId du nom de fichier
+        const mediaId = filename.replace('_fr.srt', '');
+
+        // Annuler la traduction si elle est en cours pour ce média
+        if (currentTranslation.mediaId === mediaId) {
+            log(`Annulation de la traduction en cours pour ${mediaId} (cache supprimé)`, 'info');
+            currentTranslation.shouldCancel = true;
+            currentTranslation.mediaId = null;
+            updateState({ status: 'idle', progress: 0 });
         }
 
         fs.unlinkSync(filepath);
