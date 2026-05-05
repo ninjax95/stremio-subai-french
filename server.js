@@ -17,7 +17,7 @@ const CONFIG = {
 
     // Ollama (traduction IA locale)
     OLLAMA_URL: process.env.OLLAMA_URL || 'http://localhost:11434',
-    OLLAMA_MODEL: process.env.OLLAMA_MODEL || 'mixtral', // meilleur pour traduction
+    OLLAMA_MODEL: process.env.OLLAMA_MODEL || 'qwen3:30b-a3b-instruct-2507-q4_K_M', // MoE rapide (~30 t/s sur Strix Halo)
 
     // OpenSubtitles (optionnel - fonctionne sans clé avec limitations)
     OPENSUBTITLES_API_KEY: process.env.OPENSUBTITLES_API_KEY || '',
@@ -69,8 +69,45 @@ const state = {
 // Gestion des traductions en cours
 let currentTranslation = {
     mediaId: null,
+    cacheKey: null,
     shouldCancel: false
 };
+
+// File d'attente des traductions (1 à la fois pour ne pas saturer Ollama)
+let translationQueue = [];
+let processingQueue = false;
+
+async function processTranslationQueue() {
+    if (processingQueue) return;
+    processingQueue = true;
+    while (translationQueue.length > 0) {
+        const job = translationQueue.shift();
+        const cacheFile = path.join(CONFIG.SUBTITLES_DIR, `${job.cacheKey}_fr.srt`);
+        // skip si déjà traduit
+        if (fs.existsSync(cacheFile) && fs.statSync(cacheFile).size > 100) continue;
+
+        currentTranslation = { mediaId: job.mediaId, cacheKey: job.cacheKey, shouldCancel: false };
+        try {
+            log(`Téléchargement source ${job.label}...`, 'info');
+            const srtContent = await downloadSubtitle(job.url);
+            if (srtContent && currentTranslation.cacheKey === job.cacheKey && !currentTranslation.shouldCancel) {
+                log(`Traduction de ${job.label} en cours...`, 'info');
+                await translateSRT(srtContent, job.cacheKey, `${job.mediaId} (${job.label})`);
+            }
+        } catch (e) {
+            log(`Erreur traduction ${job.label}: ${e.message}`, 'error');
+        }
+    }
+    currentTranslation = { mediaId: null, cacheKey: null, shouldCancel: false };
+    processingQueue = false;
+}
+
+function queueTranslation(job) {
+    if (currentTranslation.cacheKey === job.cacheKey) return;
+    if (translationQueue.find(j => j.cacheKey === job.cacheKey)) return;
+    translationQueue.push(job);
+    processTranslationQueue();
+}
 
 // Clients SSE connectés
 const sseClients = new Set();
@@ -333,7 +370,11 @@ async function checkOllama() {
  */
 async function translateWithMixtral(text) {
     try {
-        const prompt = `Traduis les sous-titres suivants de l'anglais vers le français. GARDE EXACTEMENT le format [numéro] au début de chaque ligne.
+        const prompt = `Traduis ces sous-titres de l'anglais vers le français. RÈGLES STRICTES:
+- GARDE le format [numéro] au début de CHAQUE ligne
+- UNE seule ligne par numéro
+- Traduis TOUT, ne saute aucune ligne
+- N'ajoute aucun commentaire
 
 ${text}`;
 
@@ -343,10 +384,10 @@ ${text}`;
             stream: false,
             options: {
                 temperature: 0.1,
-                num_predict: 2000
+                num_predict: 4096
             }
         }, {
-            timeout: 60000
+            timeout: 120000
         });
 
         return response.data.response?.trim() || text;
@@ -359,25 +400,26 @@ ${text}`;
 /**
  * Traduit un fichier SRT complet avec Mixtral (par lots)
  */
-async function translateSRT(srtContent, mediaId) {
-    const cacheFile = path.join(CONFIG.SUBTITLES_DIR, `${mediaId}_fr.srt`);
+async function translateSRT(srtContent, cacheKey, displayMedia) {
+    const cacheFile = path.join(CONFIG.SUBTITLES_DIR, `${cacheKey}_fr.srt`);
+    const display = displayMedia || cacheKey;
 
-    // Vérifier si déjà traduit
-    if (fs.existsSync(cacheFile)) {
-        log(`Traduction en cache pour ${mediaId}`, 'success');
+    // Vérifier si déjà traduit (fichier non-vide)
+    if (fs.existsSync(cacheFile) && fs.statSync(cacheFile).size > 100) {
+        log(`Traduction en cache pour ${display}`, 'success');
         updateState({ status: 'done', progress: 100 });
         return fs.readFileSync(cacheFile, 'utf8');
     }
 
     // Vérifier si cette traduction a été annulée avant même de commencer
-    if (currentTranslation.mediaId !== mediaId || currentTranslation.shouldCancel) {
-        log(`Traduction annulee avant demarrage pour ${mediaId}`, 'info');
+    if (currentTranslation.cacheKey !== cacheKey || currentTranslation.shouldCancel) {
+        log(`Traduction annulee avant demarrage pour ${display}`, 'info');
         updateState({ status: 'idle', progress: 0 });
         return null;
     }
 
-    log(`Debut de la traduction pour ${mediaId}...`, 'info');
-    updateState({ status: 'translating', currentMedia: mediaId, progress: 0 });
+    log(`Debut de la traduction pour ${display}...`, 'info');
+    updateState({ status: 'translating', currentMedia: display, progress: 0 });
 
     const parser = new SrtParser();
     let parsed;
@@ -396,7 +438,7 @@ async function translateSRT(srtContent, mediaId) {
         return null;
     }
 
-    const batchSize = 20; // 20 sous-titres par lot
+    const batchSize = 15; // 15 sous-titres par lot (évite troncature Mixtral)
     const totalBatches = Math.ceil(parsed.length / batchSize);
 
     updateState({
@@ -420,8 +462,8 @@ async function translateSRT(srtContent, mediaId) {
 
     for (let i = 0; i < parsed.length; i += batchSize) {
         // Vérifier si la traduction a été annulée OU si un nouveau média est prioritaire
-        if (currentTranslation.shouldCancel || currentTranslation.mediaId !== mediaId) {
-            log(`Traduction annulee pour ${mediaId}`, 'info');
+        if (currentTranslation.shouldCancel || currentTranslation.cacheKey !== cacheKey) {
+            log(`Traduction annulee pour ${display}`, 'info');
             updateState({ status: 'idle', progress: 0 });
             // Supprimer le fichier partiel
             if (fs.existsSync(cacheFile)) {
@@ -446,19 +488,82 @@ async function translateSRT(srtContent, mediaId) {
         const textToTranslate = batch.map((sub, idx) => `[${idx + 1}] ${sub.text}`).join('\n');
 
         try {
-            const translated = await translateWithMixtral(textToTranslate);
-            const lines = translated.split('\n');
+            // Fonction pour parser la réponse Mixtral avec marqueurs [N]
+            function parseTranslationResponse(response, maxNum) {
+                const map = {};
+                const lines = response.split('\n');
+                for (const line of lines) {
+                    const match = line.match(/^\s*[\[\(]?(\d+)[\]\)]?[\.\-\s]*(.*)/);
+                    if (match) {
+                        const num = parseInt(match[1]);
+                        const text = match[2].trim();
+                        if (num >= 1 && num <= maxNum && text) {
+                            map[num] = text;
+                        }
+                    }
+                }
+                return map;
+            }
 
+            // Premier essai
+            const translated = await translateWithMixtral(textToTranslate);
+            const translatedMap = parseTranslationResponse(translated, batch.length);
+
+            // Identifier les lignes manquantes
+            const missingIndices = [];
+            for (let idx = 0; idx < batch.length; idx++) {
+                if (!translatedMap[idx + 1]) {
+                    missingIndices.push(idx);
+                }
+            }
+
+            // Retry pour les lignes manquantes (max 2 retries)
+            if (missingIndices.length > 0 && missingIndices.length <= batch.length) {
+                for (let retry = 1; retry <= 2 && missingIndices.length > 0; retry++) {
+                    log(`Lot ${batchNum}: retry ${retry} pour ${missingIndices.length} ligne(s) manquante(s)`, 'info');
+
+                    // Reconstruire le texte uniquement avec les lignes manquantes
+                    const retryText = missingIndices
+                        .map((idx, i) => `[${i + 1}] ${batch[idx].text}`)
+                        .join('\n');
+
+                    const retryTranslated = await translateWithMixtral(retryText);
+                    const retryMap = parseTranslationResponse(retryTranslated, missingIndices.length);
+
+                    // Injecter les résultats du retry dans la map principale
+                    const stillMissing = [];
+                    missingIndices.forEach((origIdx, retryIdx) => {
+                        if (retryMap[retryIdx + 1]) {
+                            translatedMap[origIdx + 1] = retryMap[retryIdx + 1];
+                        } else {
+                            stillMissing.push(origIdx);
+                        }
+                    });
+
+                    // Mettre à jour la liste des manquants
+                    missingIndices.length = 0;
+                    missingIndices.push(...stillMissing);
+                }
+            }
+
+            // Assembler les résultats
+            let untranslatedCount = 0;
             batch.forEach((sub, idx) => {
-                // Essayer de trouver la ligne correspondante
-                let translatedText = lines[idx] || sub.text;
-                // Enlever tous les formats de numéros possibles : [X], X., X -, X. -, etc.
-                translatedText = translatedText.replace(/^\s*[\[\(]?\d+[\]\)]?[\.\-\s]*/, '');
-                translatedParts.push({
-                    ...sub,
-                    text: translatedText.trim() || sub.text
-                });
+                const translatedText = translatedMap[idx + 1];
+                if (translatedText) {
+                    translatedParts.push({
+                        ...sub,
+                        text: translatedText
+                    });
+                } else {
+                    untranslatedCount++;
+                    translatedParts.push(sub);
+                }
             });
+
+            if (untranslatedCount > 0) {
+                log(`Lot ${batchNum}: ${untranslatedCount} ligne(s) non traduites après retries`, 'error');
+            }
         } catch (e) {
             log(`Erreur lot ${batchNum}: ${e.message}`, 'error');
             // En cas d'erreur, garder les originaux
@@ -499,17 +604,13 @@ builder.defineSubtitlesHandler(async (args) => {
     const mediaId = args.id;
     log(`Nouvelle requête: ${args.type}/${mediaId}`, 'info');
 
-    // Annuler la traduction en cours si c'est un média différent
+    // Annuler les traductions en cours si c'est un média différent
     if (currentTranslation.mediaId && currentTranslation.mediaId !== mediaId) {
-        log(`Annulation de la traduction en cours pour ${currentTranslation.mediaId}`, 'info');
+        log(`Annulation des traductions en cours pour ${currentTranslation.mediaId}`, 'info');
         currentTranslation.shouldCancel = true;
+        // Vider la file d'attente des sources qui ne nous concernent plus
+        translationQueue = translationQueue.filter(j => j.mediaId === mediaId);
     }
-
-    // Réinitialiser pour ce nouveau média
-    currentTranslation = {
-        mediaId: mediaId,
-        shouldCancel: false
-    };
 
     updateState({ status: 'searching', currentMedia: mediaId });
 
@@ -566,43 +667,55 @@ builder.defineSubtitlesHandler(async (args) => {
             const englishSubs = [...opensubsEn, ...osLegacyEn];
 
             if (englishSubs.length > 0) {
-                log(`${englishSubs.length} sous-titres anglais trouvés`, 'info');
+                log(`${englishSubs.length} sources anglaises trouvées, traduction de toutes`, 'info');
 
-                // Vérifier si une traduction existe déjà en cache
-                const cacheFile = path.join(CONFIG.SUBTITLES_DIR, `${mediaId}_fr.srt`);
-                if (fs.existsSync(cacheFile)) {
-                    log(`Traduction française en cache!`, 'success');
-                    updateState({ status: 'done' });
-                    subtitles.unshift({
-                        id: 'SubAI',
-                        url: `http://127.0.0.1:${CONFIG.PORT}/subtitles/${mediaId}_fr.srt`,
-                        lang: 'SubAI'
-                    });
-                } else {
-                    // Vérifier si Ollama est disponible et lancer traduction en ARRIÈRE-PLAN
-                    const ollamaAvailable = await checkOllama();
-                    if (ollamaAvailable && englishSubs.length > 0) {
-                        const bestEnglish = englishSubs[0];
-                        log(`Lancement traduction en arrière-plan...`, 'info');
+                const ollamaAvailable = await checkOllama();
 
-                        // Traduction asynchrone (sans bloquer la réponse)
-                        downloadSubtitle(bestEnglish.url).then(srtContent => {
-                            if (srtContent) {
-                                log(`Telechargement termine, traduction en cours...`, 'info');
-                                translateSRT(srtContent, mediaId).then(result => {
-                                    if (result) {
-                                        log(`Traduction disponible!`, 'success');
-                                    }
-                                }).catch(err => log(`Erreur traduction: ${err.message}`, 'error'));
-                            }
-                        }).catch(err => log(`Erreur telechargement: ${err.message}`, 'error'));
-                    } else if (!ollamaAvailable) {
-                        log(`Ollama non disponible - traduction impossible`, 'error');
-                        updateState({ status: 'idle' });
+                // Pour chaque source EN : queue une traduction si pas déjà en cache
+                englishSubs.forEach((sub, idx) => {
+                    const cacheKey = `${mediaId}_v${idx + 1}`;
+                    const cacheFile = path.join(CONFIG.SUBTITLES_DIR, `${cacheKey}_fr.srt`);
+                    const cacheUsable = fs.existsSync(cacheFile) && fs.statSync(cacheFile).size > 100;
+
+                    if (!cacheUsable && ollamaAvailable) {
+                        queueTranslation({
+                            mediaId: mediaId,
+                            cacheKey: cacheKey,
+                            url: sub.url,
+                            label: `v${idx + 1}`
+                        });
                     }
+                });
+
+                // Attendre le 1er lot du 1er fichier (max 25s) pour que Stremio reçoive du contenu
+                const firstCacheFile = path.join(CONFIG.SUBTITLES_DIR, `${mediaId}_v1_fr.srt`);
+                const deadline = Date.now() + 25000;
+                while (Date.now() < deadline) {
+                    try {
+                        if (fs.existsSync(firstCacheFile) && fs.statSync(firstCacheFile).size > 100) break;
+                    } catch (_) {}
+                    await new Promise(r => setTimeout(r, 500));
                 }
 
-                // Ajouter les sous-titres anglais originaux
+                // Retourner une entrée SubAI pour chaque traduction qui a au moins du contenu
+                // (en tête de liste, dans l'ordre v1, v2, v3)
+                const subaiEntries = [];
+                englishSubs.forEach((sub, idx) => {
+                    const cacheKey = `${mediaId}_v${idx + 1}`;
+                    const cacheFile = path.join(CONFIG.SUBTITLES_DIR, `${cacheKey}_fr.srt`);
+                    let size = 0;
+                    try { size = fs.statSync(cacheFile).size; } catch (_) {}
+                    if (size > 100) {
+                        subaiEntries.push({
+                            id: `SubAI-v${idx + 1}`,
+                            url: `http://127.0.0.1:${CONFIG.PORT}/subtitles/${cacheKey}_fr.srt`,
+                            lang: `SubAI v${idx + 1}`
+                        });
+                    }
+                });
+                subtitles.unshift(...subaiEntries);
+
+                // Ajouter les sous-titres anglais originaux comme fallback
                 englishSubs.forEach(sub => {
                     subtitles.push({
                         id: `${sub.source}_en_${sub.id}`,
@@ -1152,16 +1265,17 @@ app.delete('/api/cache/:filename', (req, res) => {
             return res.status(404).json({ error: 'Fichier non trouvé' });
         }
 
-        // Extraire le mediaId du nom de fichier
-        const mediaId = filename.replace('_fr.srt', '');
+        // Extraire le cacheKey du nom de fichier
+        const cacheKey = filename.replace('_fr.srt', '');
 
-        // Annuler la traduction si elle est en cours pour ce média
-        if (currentTranslation.mediaId === mediaId) {
-            log(`Annulation de la traduction en cours pour ${mediaId} (cache supprimé)`, 'info');
+        // Annuler la traduction si c'est ce cacheKey qui est en cours
+        if (currentTranslation.cacheKey === cacheKey) {
+            log(`Annulation de la traduction en cours pour ${cacheKey} (cache supprimé)`, 'info');
             currentTranslation.shouldCancel = true;
-            currentTranslation.mediaId = null;
             updateState({ status: 'idle', progress: 0 });
         }
+        // Retirer ce cacheKey de la file d'attente
+        translationQueue = translationQueue.filter(j => j.cacheKey !== cacheKey);
 
         fs.unlinkSync(filepath);
         log(`Sous-titre supprimé: ${filename}`, 'info');
